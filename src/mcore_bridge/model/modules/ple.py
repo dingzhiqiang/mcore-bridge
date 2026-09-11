@@ -15,6 +15,7 @@ from ...utils import get_env_args, get_logger
 from ...utils.megatron_utils import get_num_samples, reconstruct_tensor_cp, split_cp_inputs
 from .hyper_connection_gated import Qwen4ExpTextGroupedRMSNorm
 from .kernels import gather_ple_rows, ple_gate_conv_triton
+from .ple_export import iter_ple_table_shards
 
 _MASK64 = (1 << 64) - 1
 _SPLITMIX_GAMMA = 0x9E3779B97F4A7C15
@@ -218,11 +219,27 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
                 emb.weight.data[s - tp_start:e - tp_start] = weight[s - cs:e - cs].to(dtype)
 
     @torch.no_grad()
+    def iter_trainable_table_to_hf(self):
+        """Stream the current TP-sharded parameter without FP8 requantization.
+
+        All TP ranks on this layer's PP stage must exhaust this generator. PP
+        broadcasting and target-device/rank selection belong to the bridge.
+        """
+        if self.cpu_offload:
+            raise ValueError('The trainable PLE exporter requires a GPU-resident parameter table.')
+        emb = self.ngram_embedding
+        yield from iter_ple_table_shards(emb.weight.detach(), emb.vocab_start_index, emb.vocab_end_index,
+                                         self.padded_vocab_size, self.split_ngram_parts,
+                                         parallel_state.get_tensor_model_parallel_group())
+
+    @torch.no_grad()
     def export_table_to_hf(self, hf_state_dict, prefix=''):
         """Reverse of ``fill_table_from_hf``: write the offloaded table back as HF
         shards so a full-parameter checkpoint is self-contained.
         """
         if not self.cpu_offload:
+            # Trainable tables stream via Qwen4ExpBridge._export_trainable_ple_tables.
+            # Inserting all shards into this per-layer dict would retain the full table.
             return
         total = self.padded_vocab_size
         parts = self.split_ngram_parts

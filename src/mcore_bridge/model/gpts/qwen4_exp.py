@@ -17,7 +17,7 @@ from megatron.core.transformer.transformer_block import TransformerBlockSubmodul
 from transformers.utils import is_torch_npu_available
 from typing import List, Optional
 
-from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger
+from mcore_bridge.utils import get_env_args, get_local_layer_specs, get_logger, is_master
 from mcore_bridge.utils.megatron_utils import reconstruct_tensor_cp
 
 from ..modules import (GatedDeltaNet, QSAIndexer, QSASparseCoreAttention, Qwen4ExpTextGatedResidual,
@@ -277,6 +277,73 @@ class Qwen4ExpTransformerBlock(TransformerBlock):
 
 class Qwen4ExpBridge(Qwen3NextBridge):
     hf_mixer_prefix = 'model.'
+
+    def _convert(self, mg_models, hf_state_dict, hf_prefix: str, to_mcore: bool, tqdm_desc: str = 'Converting: '):
+        mg_models = list(mg_models)
+        yield from super()._convert(mg_models, hf_state_dict, hf_prefix, to_mcore, tqdm_desc)
+        if not to_mcore and not self._peft_format:
+            # PLE tables must bypass the base converter's per-layer dictionary:
+            # it materializes the entire dict before yielding the first tensor.
+            yield from self._export_trainable_ple_tables(mg_models, hf_prefix)
+
+    def _export_trainable_ple_tables(self, mg_models, hf_prefix: str):
+        """Stream one current-value PLE shard through TP, PP, then the consumer.
+
+        All ranks export the same key order. Owning PP-stage TP ranks gather one
+        disjoint shard via SUM; each TP lane then broadcasts it through its PP
+        group. DP/CP replicas perform the same independent conversion, as for
+        ordinary bridge weights. VPP chunks are searched by global layer number.
+
+        Let B = ceil(vocab_rows / split_ngram_parts) * head_dim * dtype_bytes.
+        This generator holds one B-byte GPU shard. The enclosing export_weights
+        loop can retain the previous yield until the next one is ready: the live
+        path therefore peaks at 2B GPU bytes, and target_device='cpu' at B GPU
+        plus 2B CPU bytes, excluding small collective metadata. The consuming
+        bucket or saver owns its own bounded queue; no full table dict exists.
+        """
+        local_tables = {}
+        for model in mg_models:
+            lm_model = model.language_model if self.is_multimodal else model
+            for layer in lm_model.decoder.layers:
+                ple = getattr(layer, 'ple', None)
+                if ple is not None:
+                    local_tables[layer.layer_number] = ple.ple_embedding
+
+        for layer_number in sorted(self.config.ple_layer_ids or []):
+            table = local_tables.get(layer_number)
+            if not self._reduce_tensor_pp_group(table is not None, to_mcore=False):
+                raise RuntimeError(f'PLE layer {layer_number} has no owning PP stage during export.')
+            offloaded = self._reduce_tensor_pp_group(table is not None and table.cpu_offload, to_mcore=False)
+            if offloaded:
+                continue
+            local_shards = table.iter_trainable_table_to_hf() if table is not None else None
+            for index in range(self.config.split_ngram_parts):
+                local_shard = None
+                if local_shards is not None:
+                    actual_index, local_shard = next(local_shards)
+                    if actual_index != index:
+                        raise RuntimeError('PLE table shard order diverged across ranks.')
+                tensor = self._broadcast_ep_pp(local_shard, is_expert=False)
+                if self._only_master_rank and not is_master():
+                    tensor = None
+                elif self._target_device is not None:
+                    tensor = tensor.to(self._target_device)
+                key = (f'{hf_prefix}{self.hf_layers_prefix}.{layer_number - 1}.'
+                       f'ple.ple_embedding.ngram_embedding.shard_{index}.weight')
+                yield key, tensor
+                del tensor, local_shard
+            if local_shards is not None:
+                local_shards.close()
+
+    def _save_missing_weights(self, saver, saved_keys, source_model_dir=None):
+        # Dequantized trained table shards must not acquire the source FP8 scale
+        # when the user requests missing-weight restoration for other modules.
+        excluded_keys = set(saved_keys)
+        for layer_number in self.config.ple_layer_ids or []:
+            prefix = f'{self.hf_layers_prefix}.{layer_number - 1}.ple.ple_embedding.ngram_embedding.'
+            if f'{prefix}shard_0.weight' in saved_keys:
+                excluded_keys.add(f'{prefix}weight_scale')
+        super()._save_missing_weights(saver, excluded_keys, source_model_dir)
 
     def _get_hf_experts_attr(self, is_mtp: bool = False):
         # The checkpoint stores experts as packed per-layer tensors
