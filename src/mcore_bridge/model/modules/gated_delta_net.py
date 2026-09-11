@@ -391,7 +391,7 @@ class GatedDeltaNet(_GatedDeltaNet):
             else:
                 A_log_local_cp, dt_bias_local_cp = self.A_log, self.dt_bias
             g = -A_log_local_cp.exp() * F.softplus(alpha.float() + dt_bias_local_cp)  # In fp32
-            beta = beta.float().sigmoid()
+            beta = beta.sigmoid()
             nvtx_range_pop(suffix='g_and_beta')
 
             nvtx_range_push(suffix='gated_delta_rule')
