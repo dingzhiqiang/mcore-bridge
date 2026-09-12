@@ -35,6 +35,13 @@ _HC_WEIGHT_KEYS = (
 )
 
 
+def _combine_hyper_connection(hyper_connection, block_output, hyper_input, injection_weights):
+    """Combine one HC branch while preserving the existing BF16 op boundaries."""
+    del hyper_connection
+    injection = block_output.unsqueeze(-2) * injection_weights.unsqueeze(-1)
+    return hyper_input + injection.flatten(-2)
+
+
 class Qwen4ExpGDN(GatedDeltaNet):
     # upstream uses config.activation_func as the act_fn for both the gated output
     # norm and the conv1d; but the conv1d path asserts act_fn in ['silu', 'swish'],
@@ -97,16 +104,24 @@ class Qwen4ExpLayer(TransformerLayer):
         # sparse kernel reads the indices and ignores attn_mask_type.
         with self._patch_apply_rotary_pos_emb(), self._qsa_arbitrary_mask(qsa_selection is not None and not sparse):
             hidden_states, _ = self.self_attention(hidden_states=hidden_states, **attn_kwargs)
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = _combine_hyper_connection(
+            self.attn_hyper_connection,
+            hidden_states,
+            hyper_input,
+            injection_weights,
+        )
 
         # mlp sub-block
         hidden_states, hyper_input, injection_weights = self.mlp_hyper_connection(hidden_states)
         hidden_states = self.mlp(hidden_states)
         if isinstance(hidden_states, tuple):
             hidden_states = hidden_states[0]
-        injection = hidden_states.unsqueeze(-2) * injection_weights.unsqueeze(-1)
-        hidden_states = hyper_input + injection.flatten(-2)
+        hidden_states = _combine_hyper_connection(
+            self.mlp_hyper_connection,
+            hidden_states,
+            hyper_input,
+            injection_weights,
+        )
         return hidden_states, None
 
     @contextmanager
