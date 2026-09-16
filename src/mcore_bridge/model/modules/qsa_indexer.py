@@ -1,5 +1,6 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 import math
+import os
 import torch
 from megatron.core.extensions.transformer_engine import TELinear
 from torch import nn
@@ -175,18 +176,25 @@ class QSAIndexer(nn.Module):
         starts = torch.arange(max_blocks, device=device) * R
         block_keys = apply_rope(pooled, cos[:, starts], sin[:, starts])  # [b, nb, d]
 
-        # ---- score all (query, block) pairs ----
-        scores = torch.einsum('bqhd,bkd->bqhk', q.float(), block_keys.float())
-        scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)  # [b, s, nb]
-
-        # ---- restrict to blocks fully inside the causal prefix ----
-        n_blocks = (torch.arange(s, device=device) + 1) // R  # [s]
+        # Bound score workspace by queries, preserving all candidate blocks.
+        chunk_size = int(os.environ.get('QWEN_QSA_QUERY_CHUNK_SIZE', '1024'))
+        if chunk_size <= 0:
+            raise ValueError('QWEN_QSA_QUERY_CHUNK_SIZE must be positive')
+        n_blocks = (torch.arange(s, device=device) + 1) // R
         block_ids = torch.arange(max_blocks, device=device)
-        scores = scores.masked_fill((block_ids[None, :] >= n_blocks[:, None])[None], float('-inf'))
-
         k = min(self.block_topk, max_blocks)
-        top_blocks = scores.topk(k, dim=-1).indices  # [b, s, k]
-        keep = top_blocks < n_blocks[None, :, None]  # drop the -inf padding slots
+        top_blocks = torch.empty((b, s, k), dtype=torch.long, device=device)
+        keep = torch.empty((b, s, k), dtype=torch.bool, device=device)
+        keys_float = block_keys.float()
+        for start in range(0, s, chunk_size):
+            end = min(start + chunk_size, s)
+            scores = torch.einsum('bqhd,bkd->bqhk', q[:, start:end].float(), keys_float)
+            scores = torch.relu(scores).sum(dim=2) / math.sqrt(self.index_head_dim)
+            scores = scores.masked_fill((block_ids[None, :] >= n_blocks[start:end, None])[None], float('-inf'))
+            selected = scores.topk(k, dim=-1).indices
+            top_blocks[:, start:end] = selected
+            keep[:, start:end] = selected < n_blocks[None, start:end, None]
+            del scores, selected
         return top_blocks, keep, n_blocks
 
     @torch.no_grad()
@@ -356,30 +364,32 @@ class QSAIndexer(nn.Module):
         first_pack = cu_seqlens[block_doc].long() + block_in_doc_idx * R  # [NB]
         block_keys = apply_rope(pooled, cos[first_pack], sin[first_pack])  # [NB, d]
 
-        # ---- score every (token, block) pair ----
-        scores = torch.einsum('thd,kd->thk', q.float(), block_keys.float())
-        scores = torch.relu(scores).sum(dim=1) / math.sqrt(self.index_head_dim)  # [T, NB]
-
-        # ---- restrict to same-document, causally-before blocks ----
-        q_nblocks = (pos_in_doc + 1) // R  # [T]
-        valid = (block_doc[None, :] == token_doc[:, None]) & \
-            (block_in_doc_idx[None, :] < q_nblocks[:, None])  # [T, NB]
-        scores = scores.masked_fill(~valid, float('-inf'))
-
-        # ---- top-k blocks -> token indices ----
+        chunk_size = int(os.environ.get('QWEN_QSA_QUERY_CHUNK_SIZE', '1024'))
+        if chunk_size <= 0:
+            raise ValueError('QWEN_QSA_QUERY_CHUNK_SIZE must be positive')
+        q_nblocks = (pos_in_doc + 1) // R
         k = min(self.block_topk, NB)
-        top_blocks = scores.topk(k, dim=-1).indices  # [T, k] into [0, NB)
-        keep = valid.gather(1, top_blocks)  # [T, k]
         arange_r = torch.arange(R, device=device)
-        base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R  # [T, k]
-        top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)  # [T, k*R]
-        top_keep = keep.unsqueeze(-1).expand(-1, -1, R).reshape(T, k * R)
-        top_idx = torch.where(top_keep, top_idx, top_idx.new_full((), -1))
-
-        # ---- tail: the query's own partial block, causally truncated ----
-        tail_base = cu_seqlens[token_doc].long() + q_nblocks * R  # [T]
-        tail_idx = tail_base.unsqueeze(-1) + arange_r[None, :]  # [T, R]
-        token_pos = torch.arange(T, device=device)
-        tail_idx = torch.where(tail_idx <= token_pos[:, None], tail_idx, tail_idx.new_full((), -1))
-
-        return torch.cat([top_idx, tail_idx], dim=-1).to(torch.int64)
+        result = torch.empty((T, k * R + R), dtype=torch.int64, device=device)
+        keys_float = block_keys.float()
+        # Each query still sees every complete block in its document.
+        # Write final indices directly, without retaining per-chunk workspaces.
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            scores = torch.einsum('thd,kd->thk', q[start:end].float(), keys_float)
+            scores = torch.relu(scores).sum(dim=1) / math.sqrt(self.index_head_dim)
+            valid = (block_doc[None, :] == token_doc[start:end, None]) & (
+                block_in_doc_idx[None, :] < q_nblocks[start:end, None])
+            scores = scores.masked_fill(~valid, float('-inf'))
+            top_blocks = scores.topk(k, dim=-1).indices
+            keep = valid.gather(1, top_blocks)
+            base = cu_seqlens[block_doc[top_blocks]].long() + block_in_doc_idx[top_blocks] * R
+            top_idx = (base.unsqueeze(-1) + arange_r).flatten(-2)
+            top_keep = keep.unsqueeze(-1).expand(-1, -1, R).reshape(end - start, k * R)
+            result[start:end, :k * R] = torch.where(top_keep, top_idx, top_idx.new_full((), -1))
+            tail_base = cu_seqlens[token_doc[start:end]].long() + q_nblocks[start:end] * R
+            tail_idx = tail_base.unsqueeze(-1) + arange_r[None, :]
+            token_pos = torch.arange(start, end, device=device)
+            result[start:end, k * R:] = torch.where(tail_idx <= token_pos[:, None], tail_idx, tail_idx.new_full((), -1))
+            del scores, valid, top_blocks, keep, base, top_idx, top_keep, tail_idx
+        return result
