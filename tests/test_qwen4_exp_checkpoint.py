@@ -338,22 +338,26 @@ def test_restore_index_publish_failure_rolls_back_new_shards(checkpoints, monkey
     assert {path.name: path.read_bytes() for path in output.iterdir()} == before
 
 
-@pytest.mark.parametrize('invalid', [None, 'missing', 'mixed', 'shape', 'stale_scale', 'non_ple'])
-def test_restore_fp8_ple_conversion_requires_complete_bf16_export(checkpoints, invalid):
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float16, torch.float32])
+@pytest.mark.parametrize('invalid', [None, 'missing', 'mixed', 'mixed_float', 'shape', 'stale_scale', 'non_ple'])
+def test_restore_fp8_ple_conversion_requires_complete_float_export(checkpoints, invalid, dtype):
     source, output, source_tensors, exported_tensors = checkpoints
     prefix = 'model.language_model.layers.0.ple.ple_embedding.ngram_embedding'
     shards = [f"{prefix}.shard_{index}.weight" for index in range(2)]
     scale = f"{prefix}.weight_scale"
     for key in shards:
         source_tensors[key] = torch.ones(2, 2).to(torch.float8_e4m3fn)
-        exported_tensors[key] = torch.full((2, 2), 7.0, dtype=torch.bfloat16)
+        exported_tensors[key] = torch.full((2, 2), 7.0, dtype=dtype)
     source_tensors[scale] = torch.tensor(0.5)
     if invalid == 'missing':
         del exported_tensors[shards[1]]
     elif invalid == 'mixed':
         exported_tensors[shards[1]] = source_tensors[shards[1]]
+    elif invalid == 'mixed_float':
+        other_dtype = torch.float32 if dtype != torch.float32 else torch.float16
+        exported_tensors[shards[1]] = exported_tensors[shards[1]].to(other_dtype)
     elif invalid == 'shape':
-        exported_tensors[shards[1]] = torch.ones(1, 2, dtype=torch.bfloat16)
+        exported_tensors[shards[1]] = torch.ones(1, 2, dtype=dtype)
     elif invalid == 'stale_scale':
         exported_tensors[scale] = source_tensors[scale]
     elif invalid == 'non_ple':
@@ -373,7 +377,7 @@ def test_restore_fp8_ple_conversion_requires_complete_bf16_export(checkpoints, i
     assert scale not in index['weight_map']
     assert set(tensors) == set(source_tensors) - {scale, 'mtp.fc_hidden.weight'}
     for key in shards:
-        assert tensors[key].dtype == torch.bfloat16
+        assert tensors[key].dtype == dtype
         torch.testing.assert_close(tensors[key], exported_tensors[key], rtol=0, atol=0)
 
 

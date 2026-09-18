@@ -263,7 +263,7 @@ def restore_qwen4_exp_fixed_assets(
     unknown = output_keys - source_keys
     if unknown:
         raise ValueError(f"Export contains unknown checkpoint tensors: {sorted(unknown)}")
-    # The bridge exports dequantized PLE tables as current BF16 parameters.
+    # The bridge exports dequantized PLE tables in the parameter dtype.
     # Their original FP8 scale must disappear, but only after every source
     # shard has been exported with the same shape in the new representation.
     ple_groups: dict[str, dict[int, str]] = {}
@@ -277,17 +277,20 @@ def restore_qwen4_exp_fixed_assets(
             ple_groups.setdefault(match[1], {})[int(match[2])] = key
     converted_ple_keys: set[str] = set()
     omitted_ple_scales: set[str] = set()
+    dequantized_dtypes = {'BF16', 'F16', 'F32'}
     for prefix, shards in ple_groups.items():
-        if not any(source_tensors[key]['dtype'] == 'F8_E4M3' and output_tensors.get(key, {}).get('dtype') == 'BF16'
-                   for key in shards.values()):
+        if not any(source_tensors[key]['dtype'] == 'F8_E4M3'
+                   and output_tensors.get(key, {}).get('dtype') in dequantized_dtypes for key in shards.values()):
             continue
-        if set(shards) != set(range(len(shards))) or any(
-                source_tensors[key]['dtype'] != 'F8_E4M3' or output_tensors.get(key, {}).get('dtype') != 'BF16'
-                or output_tensors[key]['shape'] != source_tensors[key]['shape'] for key in shards.values()):
-            raise ValueError(f"Incomplete or invalid BF16 PLE conversion: {prefix}")
+        output_dtypes = {output_tensors.get(key, {}).get('dtype') for key in shards.values()}
+        if (len(output_dtypes) != 1 or not output_dtypes <= dequantized_dtypes
+                or set(shards) != set(range(len(shards)))
+                or any(source_tensors[key]['dtype'] != 'F8_E4M3'
+                       or output_tensors[key]['shape'] != source_tensors[key]['shape'] for key in shards.values())):
+            raise ValueError(f"Incomplete or invalid floating-point PLE conversion: {prefix}")
         scale_key = f"{prefix}.weight_scale"
         if scale_key not in source_keys or scale_key in output_keys:
-            raise ValueError(f"BF16 PLE conversion requires removing the source scale: {scale_key}")
+            raise ValueError(f"Floating-point PLE conversion requires removing the source scale: {scale_key}")
         converted_ple_keys.update(shards.values())
         omitted_ple_scales.add(scale_key)
     vision_keys = {key for key in source_keys if key.startswith(_VISION_PREFIX)}
