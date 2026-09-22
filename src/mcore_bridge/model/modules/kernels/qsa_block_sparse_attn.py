@@ -1,4 +1,4 @@
-# VENDORED FILE -- DO NOT EDIT LOCALLY.
+# Vendored from Miles; local long-context addressing fix documented below.
 #
 # refer : radixark/miles, miles_plugins/models/qwen3_8_next/ops/kernel/qsa_block_sparse_attn.py
 #
@@ -116,7 +116,8 @@ def _qsa_bs_fwd_kernel(
         # group-granular lookup would assign some tokens to the wrong block.
         blk = blk_base[:, None] + (offs_k[None, :] - tok_base[:, None]) // BLK
         sel = tl.load(
-            SEL + offs_q[:, None] * stride_st + blk,
+            # Promote before multiplication: the selection bitmap can exceed 2**31 elements.
+            SEL + offs_q[:, None].to(tl.int64) * stride_st + blk,
             mask=q_mask[:, None] & k_in[None, :] & (blk >= 0) & (blk < NB),
             other=0,
         )
@@ -228,7 +229,8 @@ def _qsa_bs_dq_kernel(
         # group-granular lookup would assign some tokens to the wrong block.
         blk = blk_base[:, None] + (offs_k[None, :] - tok_base[:, None]) // BLK
         sel = tl.load(
-            SEL + offs_q[:, None] * stride_st + blk,
+            # Promote before multiplication: the selection bitmap can exceed 2**31 elements.
+            SEL + offs_q[:, None].to(tl.int64) * stride_st + blk,
             mask=q_mask[:, None] & k_in[None, :] & (blk >= 0) & (blk < NB),
             other=0,
         )
@@ -324,7 +326,8 @@ def _qsa_bs_dkdv_kernel(
 
         blk = blk_base[:, None] + (offs_k[None, :] - tok_base[:, None]) // BLK
         sel = tl.load(
-            SEL + offs_q[:, None] * stride_st + blk,
+            # Promote before multiplication: the selection bitmap can exceed 2**31 elements.
+            SEL + offs_q[:, None].to(tl.int64) * stride_st + blk,
             mask=q_mask[:, None] & k_in[None, :] & (blk >= 0) & (blk < NB),
             other=0,
         )
