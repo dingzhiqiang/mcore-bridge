@@ -653,25 +653,20 @@ class Qwen4ExpTextPLELayer(nn.Module):
         thd = packed_seq_params is not None and getattr(packed_seq_params, 'qkv_format', 'bshd') == 'thd'
         if thd:
             num_samples = get_num_samples(packed_seq_params)
-            # PackedSeqParams.max_seqlen_q is declared `int` in mcore and swift
-            # normalizes it to int, so `.item()` would raise AttributeError;
-            # tolerate a 0-d tensor from other callers.
-            max_seqlen_q = packed_seq_params.max_seqlen_q
-            max_len = int(max_seqlen_q.item() if torch.is_tensor(max_seqlen_q) else max_seqlen_q)
             cu = packed_seq_params.cu_seqlens_q
             total = hidden_states.shape[0]
-            hid = hidden_states.new_zeros((num_samples, max_len, hidden_states.shape[-1]))
-            toks = input_ids.new_full((num_samples, max_len), self.ple_embedding.eos_token_id)
+            offsets = cu[:num_samples + 1].tolist()
+            pieces = []
             for i in range(num_samples):
-                start, end = int(cu[i]), int(cu[i + 1])
-                hid[i, :end - start] = hidden_states[start:end, 0]
-                toks[i, :end - start] = input_ids[0, start:end]
-            res = self.compute(hid, toks)
-            out = res.new_zeros((total, 1, res.shape[-1]))
-            for i in range(num_samples):
-                start, end = int(cu[i]), int(cu[i + 1])
-                out[start:end, 0] = res[i, :end - start]
-            return out
+                start, end = offsets[i:i + 2]
+                if end > start:
+                    pieces.append(
+                        self.compute(hidden_states[start:end].transpose(0, 1), input_ids[:, start:end]).transpose(0, 1))
+            if not pieces:
+                raise ValueError('PLE packed input has no nonempty samples')
+            if offsets[-1] < total:
+                pieces.append(pieces[0].new_zeros((total - offsets[-1], 1, pieces[0].shape[-1])))
+            return torch.cat(pieces, dim=0)
         else:
             # [s, b, nH] -> [b, s, nH]; input_ids [b, s]
             hid = hidden_states.transpose(0, 1)
