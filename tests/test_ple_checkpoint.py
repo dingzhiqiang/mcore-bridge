@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from megatron.core.tensor_parallel import VocabParallelEmbedding
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 from mcore_bridge.model.modules.ple import Qwen4ExpTextNGramEmbedding, Qwen4ExpTextPLELayer
@@ -60,6 +61,20 @@ class _PLELayer(Qwen4ExpTextPLELayer):
         torch.nn.Module.__init__(self)
         self.ple_embedding = table
         self.conv1d = torch.nn.Conv1d(dim, dim, 3, groups=dim, bias=False)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA is required for pinned host memory')
+def test_host_table_stays_on_cpu_with_cuda_default_device(tp_group):
+    table = Qwen4ExpTextNGramEmbedding.__new__(Qwen4ExpTextNGramEmbedding)
+    torch.nn.Module.__init__(table)
+    config = SimpleNamespace(params_dtype=torch.bfloat16)
+
+    with torch.device('cuda'):
+        table._init_host_table(config, padded_vocab_size=16, head_dim=4)
+
+    assert table.host_table.device.type == 'cpu'
+    assert table.host_table.is_pinned()
+    assert table.host_table.shape == (16, 4)
 
 
 @pytest.mark.parametrize('tp_size', [1, 2, 8])

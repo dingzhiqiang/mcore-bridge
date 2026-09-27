@@ -380,7 +380,7 @@ class Qwen4ExpTextNGramEmbedding(nn.Module):
         self.vocab_start = tp_rank * per_partition
         self.vocab_end = min(padded_vocab_size, self.vocab_start + per_partition)
         n_local = max(0, self.vocab_end - self.vocab_start)
-        self.host_table = torch.empty(n_local, head_dim, dtype=config.params_dtype, pin_memory=True)
+        self.host_table = torch.empty(n_local, head_dim, dtype=config.params_dtype, device='cpu', pin_memory=True)
         self._tp_size = tp_size
         self._tp_group = parallel_state.get_tensor_model_parallel_group()
 
