@@ -1,9 +1,8 @@
 # Copyright (c) ModelScope Contributors. All rights reserved.
 """Packed PLE computes each real segment without longest-segment padding."""
 
-from types import SimpleNamespace
-
 import torch
+from types import SimpleNamespace
 
 from mcore_bridge.model.modules.ple import Qwen4ExpTextPLELayer
 
@@ -16,9 +15,8 @@ class _CausalPLE(Qwen4ExpTextPLELayer):
         self.ple_embedding = SimpleNamespace(eos_token_id=0)
 
     def compute(self, hidden_states, input_ids):
-        return (hidden_states * self.scale +
-                hidden_states.cumsum(dim=1) * 0.25 +
-                input_ids.unsqueeze(-1).to(hidden_states.dtype) * 0.125)
+        return (hidden_states * self.scale + hidden_states.cumsum(dim=1) * 0.25
+                + input_ids.unsqueeze(-1).to(hidden_states.dtype) * 0.125)
 
 
 def _padded_reference(model, hidden_states, input_ids, offsets, max_len):
@@ -41,9 +39,7 @@ def test_packed_ple_preserves_outputs_and_gradients_with_uneven_segments_and_pad
     packed_input = reference_input.detach().clone().requires_grad_()
     input_ids = torch.arange(10).unsqueeze(0)
     offsets = [0, 3, 4, 8]
-    packed = SimpleNamespace(
-        qkv_format='thd', num_samples=3, max_seqlen_q=4,
-        cu_seqlens_q=torch.tensor([*offsets, 10]))
+    packed = SimpleNamespace(qkv_format='thd', num_samples=3, max_seqlen_q=4, cu_seqlens_q=torch.tensor([*offsets, 10]))
 
     reference = _padded_reference(model, reference_input, input_ids, offsets, 4)
     actual = model._forward_impl(packed_input, input_ids, packed)

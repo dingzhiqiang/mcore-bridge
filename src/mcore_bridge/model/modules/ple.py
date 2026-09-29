@@ -499,8 +499,12 @@ class Qwen4ExpTextPLELayer(nn.Module):
         replicated_prefixes = ('key_proj', 'value_proj', 'norm_key', 'norm_query', 'norm_conv', 'conv1d')
         for name, param in self.named_parameters():
             if name.startswith(replicated_prefixes) or name.endswith('norm.weight'):
-                # Replicated across TP; reduce grads across TP when SP is on.
+                # forward gathers the full SP sequence before computing PLE,
+                # and scatter's backward gathers the full output gradient.
+                # Each TP rank therefore already has the complete gradient.
+                # Synchronize replicas with AVG rather than multiplying it by TP.
                 setattr(param, 'sequence_parallel', config.sequence_parallel)
+                setattr(param, 'average_gradients_across_tp_domain', config.sequence_parallel)
 
     def _short_conv(self, hidden_states: torch.Tensor) -> torch.Tensor:
         # Training variant of transformers `_short_conv` (no conv state cache):
